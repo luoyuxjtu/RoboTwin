@@ -1,4 +1,4 @@
-"""Run a single RoboTwin episode with the SAPIEN viewer and stream robot data
+"""Run RoboTwin episodes with the SAPIEN viewer and stream robot data
 to the terminal.
 
 Usage:
@@ -7,8 +7,15 @@ Usage:
 
 Equivalent (pipeline-wise) of:
     bash collect_data.sh beat_block_hammer demo_randomized 0
-but limited to ONE episode, with the SAPIEN viewer enabled and per-step
-sensor data printed to stdout instead of HDF5 saving.
+but limited to ONE episode at a time, with the SAPIEN viewer enabled and
+per-step sensor data printed to stdout instead of HDF5 saving.
+
+Interaction:
+  - After the scene is loaded the script pauses and prints
+    "Press any key to start the episode...", so you can frame the viewer
+    before the action starts.
+  - When the episode finishes you are prompted again; pressing any key
+    re-runs the episode, while q / Esc / closing the viewer exits.
 
 What we print every ~0.1s of wall time:
   - joint angles of both arms (qpos) + normalized gripper opening
@@ -182,15 +189,135 @@ class DataLogger:
 
 
 def install_logger(task, period_s=0.1):
+    """Install (or refresh) the data-printing hook on task._update_render.
+
+    Always wraps the *class* method instead of the current instance attribute
+    so that re-installing on a subsequent episode does not re-wrap a stale
+    hook from the previous one.
+    """
     logger = DataLogger(task, period_s=period_s)
-    orig_update = task._update_render
+    cls_update = type(task)._update_render
 
     def hooked_update():
-        orig_update()
+        cls_update(task)
         logger.maybe_log()
 
     task._update_render = hooked_update
     return logger
+
+
+def uninstall_logger(task):
+    if "_update_render" in task.__dict__:
+        del task.__dict__["_update_render"]
+
+
+def _pump_viewer(task, viewer):
+    """Render one viewer frame, returning True if the viewer was closed."""
+    if viewer is None:
+        return True
+    try:
+        if getattr(viewer, "closed", False):
+            return True
+        type(task)._update_render(task)  # bypass the data hook
+        viewer.render()
+    except Exception:
+        return True
+    return False
+
+
+def wait_for_key(message, task=None, viewer=None):
+    """Block until the user presses a key (or closes the viewer).
+
+    While waiting we keep the SAPIEN viewer responsive by rendering on a tight
+    loop. Falls back to a blocking ``input()`` if stdin is not a TTY.
+
+    Returns "quit" if the user pressed q / Esc / Ctrl-C or closed the viewer,
+    otherwise returns the character they pressed (may be empty string).
+    """
+    print(f"\n>>> {message}", flush=True)
+
+    is_tty = sys.stdin.isatty()
+    fd = sys.stdin.fileno() if is_tty else None
+    old_settings = None
+    if is_tty:
+        try:
+            import termios
+            import tty
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            is_tty = False
+
+    try:
+        while True:
+            if viewer is not None and _pump_viewer(task, viewer):
+                return "quit"
+
+            if is_tty:
+                import select
+                ready, _, _ = select.select([sys.stdin], [], [], 0.005)
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch in ("q", "Q", "\x1b", "\x03"):  # q / Esc / Ctrl-C
+                        return "quit"
+                    return ch
+            else:
+                try:
+                    input()
+                    return ""
+                except (EOFError, KeyboardInterrupt):
+                    return "quit"
+    finally:
+        if is_tty and old_settings is not None:
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+
+def run_one_episode(task, args, seed, log_period):
+    """Set up the scene, wait for the user, run one episode, wait again.
+
+    Returns "quit" if the user wants to exit, otherwise None.
+    """
+    task.setup_demo(now_ep_num=0, seed=seed, **args)
+    viewer = getattr(task, "viewer", None)
+
+    # Make the freshly-loaded scene actually appear before we block on input.
+    for _ in range(5):
+        if _pump_viewer(task, viewer):
+            return "quit"
+
+    if wait_for_key(
+        "Scene ready. Press any key to start the episode  (q/Esc to quit)...",
+        task=task,
+        viewer=viewer,
+    ) == "quit":
+        return "quit"
+
+    install_logger(task, period_s=log_period)
+    try:
+        task.play_once()
+    except Exception as e:
+        print(f"\n[error during play_once] {e}")
+    finally:
+        uninstall_logger(task)
+
+    success = False
+    try:
+        success = bool(getattr(task, "plan_success", False)) and bool(task.check_success())
+    except Exception:
+        pass
+    print("\n" + "=" * 50)
+    print("Episode finished:", "SUCCESS" if success else "FAIL")
+    print("=" * 50)
+
+    return wait_for_key(
+        "Press any key to re-run the episode  (q/Esc or close the viewer to quit)...",
+        task=task,
+        viewer=viewer,
+    )
 
 
 def main():
@@ -201,6 +328,9 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--log-period", type=float, default=0.1,
                         help="seconds between successive data prints")
+    parser.add_argument("--increment-seed", action="store_true",
+                        help="bump the seed by 1 on every re-run "
+                             "(default: replay the same episode each time)")
     cli = parser.parse_args()
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(cli.gpu))
@@ -213,37 +343,38 @@ def main():
     print(f"Seed        : {cli.seed}")
     print(f"Embodiment  : {args['embodiment_name']}")
     print(f"Render freq : every {args['render_freq']} sim steps (viewer ON)")
-    print("Starting simulation. Close the SAPIEN viewer window to exit.\n")
 
-    task.setup_demo(now_ep_num=0, seed=cli.seed, **args)
-    install_logger(task, period_s=cli.log_period)
+    seed = cli.seed
+    iteration = 0
 
-    try:
-        task.play_once()
-    finally:
-        success = bool(getattr(task, "plan_success", False)) and bool(task.check_success())
-        print("\n" + "=" * 50)
-        print("Episode finished:", "SUCCESS" if success else "FAIL")
-        print("=" * 50)
+    while True:
+        iteration += 1
+        print(f"\n############ Episode iteration {iteration} (seed={seed}) ############")
+
+        result = "quit"
+        try:
+            result = run_one_episode(task, args, seed, cli.log_period)
+        except Exception as e:
+            print(f"\n[error during iteration] {e}")
 
         viewer = getattr(task, "viewer", None)
         if viewer is not None:
-            print("Holding the viewer open. Close the window to exit.")
-            try:
-                while not viewer.closed:
-                    task._update_render()
-                    viewer.render()
-            except Exception:
-                pass
             try:
                 viewer.close()
             except Exception:
                 pass
-
         try:
             task.close_env()
         except Exception:
             pass
+
+        if result == "quit":
+            break
+
+        if cli.increment_seed:
+            seed += 1
+
+    print("\nBye.")
 
 
 if __name__ == "__main__":
